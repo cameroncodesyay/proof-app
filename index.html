@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Proof</title>
+<meta name="theme-color" content="#020617" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Proof" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<link rel="icon" href="icon-192.png" />
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js" crossorigin></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #020617; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+  #boot-status { color: #94a3b8; font-size: 14px; padding: 40px 20px; text-align: center; }
+  #boot-status.error { color: #f87171; }
+</style>
+</head>
+<body>
+<div id="root"><div id="boot-status">Loading Proof…</div></div>
+<script>
+  window.addEventListener("error", function (e) {
+    var el = document.getElementById("boot-status");
+    if (el) {
+      el.className = "error";
+      el.textContent = "Something failed to load: " + (e.message || "unknown error") +
+        ". Check your connection and reload the page.";
+    }
+  });
+  setTimeout(function () {
+    var el = document.getElementById("boot-status");
+    if (el && el.textContent === "Loading Proof…") {
+      el.className = "error";
+      el.textContent = "This is taking a while — likely a slow connection. Try reloading, ideally on Wi-Fi.";
+    }
+  }, 8000);
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+  }
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ---------- constants & helpers ----------
+const ML_PER_OZ = 29.5735;
+const ETHANOL_DENSITY = 0.789;
+const METABOLISM_RATE = 0.015;
+const SESSION_WINDOW_MS = 24 * 60 * 60 * 1000;
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+function gramsAlcohol(volumeOz, abv) { return volumeOz * ML_PER_OZ * (abv / 100) * ETHANOL_DENSITY; }
+function widmarkR(sex) { return sex === "female" ? 0.55 : 0.68; }
+
+function calcSession(drinks, profile) {
+  const now = Date.now();
+  const recent = drinks.filter((d) => now - d.timestamp <= SESSION_WINDOW_MS && now - d.timestamp >= 0);
+  if (!recent.length || !profile?.weightLb) return { bac: 0, clearanceHours: 0, count: recent.length };
+  const totalGrams = recent.reduce((s, d) => s + gramsAlcohol(d.volumeOz, d.abv), 0);
+  const weightG = profile.weightLb * 453.592;
+  const r = widmarkR(profile.sex);
+  const peakBAC = (totalGrams / (weightG * r)) * 100;
+  const firstTime = Math.min(...recent.map((d) => d.timestamp));
+  const hoursElapsed = (now - firstTime) / 3600000;
+  const bac = Math.max(0, peakBAC - METABOLISM_RATE * hoursElapsed);
+  return { bac, clearanceHours: bac / METABOLISM_RATE, count: recent.length };
+}
+
+function fmtClearance(hours) {
+  if (hours <= 0) return "0h 0m";
+  const h = Math.floor(hours), m = Math.round((hours - h) * 60);
+  return `${h}h ${m}m`;
+}
+function isSameDay(ts, date) {
+  const a = new Date(ts);
+  return a.getFullYear() === date.getFullYear() && a.getMonth() === date.getMonth() && a.getDate() === date.getDate();
+}
+function startOfWeek(date) {
+  const d = new Date(date); const day = d.getDay(); const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff); d.setHours(0, 0, 0, 0); return d;
+}
+const DAY_LETTERS = ["S", "M", "T", "W", "T", "F", "S"];
+const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_LABELS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function bacColor(bac) { if (bac >= 0.08) return "#f87171"; if (bac >= 0.04) return "#fbbf24"; if (bac > 0) return "#34d399"; return "#e2e8f0"; }
+
+// ---------- local storage (private, this device) ----------
+const store = {
+  get(key) { try { const v = localStorage.getItem("proof:" + key); return v ? JSON.parse(v) : null; } catch (e) { return null; } },
+  set(key, val) { try { localStorage.setItem("proof:" + key, JSON.stringify(val)); return true; } catch (e) { return false; } },
+};
+
+// ---------- small UI atoms ----------
+function StatTile({ emoji, value, label, color, ring }) {
+  return (
+    <div style={{ position: "relative", overflow: "hidden", borderRadius: 16, background: "rgba(30,41,59,0.6)", border: "1px solid rgba(51,65,85,0.5)", padding: 16 }}>
+      {ring !== undefined && (
+        <svg style={{ position: "absolute", right: -16, top: -16, width: 80, height: 80, opacity: 0.4 }} viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15.5" fill="none" stroke="#1e293b" strokeWidth="3" />
+          <circle cx="18" cy="18" r="15.5" fill="none" stroke={ring.color} strokeWidth="3" strokeLinecap="round"
+            strokeDasharray={`${ring.pct * 97.4} 200`} transform="rotate(-90 18 18)" />
+        </svg>
+      )}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 24, fontWeight: 600, color: color || "#f1f5f9" }}>
+        <span>{emoji}</span><span>{value}</span>
+      </div>
+      <div style={{ fontSize: 14, color: "#94a3b8", marginTop: 4 }}>{label}</div>
+    </div>
+  );
+}
+
+function PillButton({ active, onClick, children }) {
+  return (
+    <button onClick={onClick} style={{
+      padding: "8px 16px", borderRadius: 12, fontSize: 14, fontWeight: 500,
+      border: `1px solid ${active ? "#22d3ee" : "#334155"}`,
+      background: active ? "rgba(34,211,238,0.15)" : "rgba(30,41,59,0.6)",
+      color: active ? "#67e8f9" : "#94a3b8", cursor: "pointer",
+    }}>{children}</button>
+  );
+}
+
+function Spinner({ size = 18 }) {
+  return <div style={{
+    width: size, height: size, border: "2px solid rgba(148,163,184,0.3)", borderTopColor: "#22d3ee",
+    borderRadius: "50%", animation: "spin 0.7s linear infinite",
+  }} />;
+}
+const styleTag = document.createElement("style");
+styleTag.textContent = "@keyframes spin { to { transform: rotate(360deg); } }";
+document.head.appendChild(styleTag);
+
+// ---------- Week strip ----------
+function WeekStrip({ selectedDate, setSelectedDate, drinksByDay }) {
+  const weekStart = startOfWeek(selectedDate);
+  const days = Array.from({ length: 7 }, (_, i) => { const d = new Date(weekStart); d.setDate(weekStart.getDate() + i); return d; });
+  const today = new Date();
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "0 4px", marginBottom: 20 }}>
+      {days.map((d, i) => {
+        const selected = isSameDay(d.getTime(), selectedDate);
+        const hasDrinks = drinksByDay.has(d.toDateString());
+        const isToday = isSameDay(d.getTime(), today);
+        return (
+          <button key={i} onClick={() => setSelectedDate(d)} style={{ background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 6, cursor: "pointer" }}>
+            {hasDrinks ? (
+              <div style={{ width: 36, height: 36, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "50%",
+                background: selected ? "rgba(34,211,238,0.2)" : "#1e293b", boxShadow: selected ? "0 0 0 2px #22d3ee" : "none", fontSize: 15 }}>🍸</div>
+            ) : (
+              <div style={{ width: 36, height: 36, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "50%",
+                border: `1px solid ${selected ? "#22d3ee" : "#334155"}`, background: selected ? "rgba(34,211,238,0.1)" : "transparent",
+                color: selected ? "#67e8f9" : "#64748b", fontSize: 12, fontWeight: 500 }}>{DAY_LETTERS[d.getDay()]}</div>
+            )}
+            <span style={{ fontSize: 12, color: isToday ? "#67e8f9" : "#64748b", fontWeight: isToday ? 600 : 400 }}>{d.getDate()}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- Drink log row ----------
+function DrinkRow({ drink, onOpen }) {
+  const time = new Date(drink.timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return (
+    <button onClick={() => onOpen(drink)} style={{
+      width: "100%", textAlign: "left", background: "rgba(30,41,59,0.6)", border: "1px solid rgba(51,65,85,0.5)",
+      borderRadius: 16, padding: 16, display: "flex", alignItems: "center", gap: 16, cursor: "pointer",
+    }}>
+      <div style={{ width: 44, height: 44, borderRadius: "50%", background: "rgba(34,211,238,0.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>🍷</div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+          <span style={{ fontWeight: 600, color: "#f1f5f9", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{drink.name}</span>
+          <span style={{ fontSize: 12, color: "#64748b", flexShrink: 0 }}>{time}</span>
+        </div>
+        <div style={{ display: "flex", gap: 12, fontSize: 12, color: "#94a3b8", marginTop: 4 }}>
+          <span>💧 {drink.abv.toFixed(1)}%</span>
+          <span>🔥 {Math.round(drink.calories)}</span>
+          <span>{drink.volumeOz.toFixed(1)} oz</span>
+        </div>
+      </div>
+    </button>
+  );
+}
+
+// ---------- Drink detail modal ----------
+function InfoTile({ emoji, value, label, full }) {
+  return (
+    <div style={{ background: "rgba(30,41,59,0.6)", borderRadius: 16, padding: 16, gridColumn: full ? "span 2" : undefined }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 20, fontWeight: 600, color: "#f1f5f9" }}><span>{emoji}</span><span>{value}</span></div>
+      <div style={{ fontSize: 14, color: "#94a3b8", marginTop: 4 }}>{label}</div>
+    </div>
+  );
+}
+
+function ModalShell({ title, onClose, children, footer }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "#020617", display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "24px 20px 8px" }}>
+        <h2 style={{ fontSize: 24, fontWeight: 700, color: "#f1f5f9", margin: 0 }}>{title}</h2>
+        <button onClick={onClose} style={{ width: 36, height: 36, borderRadius: "50%", background: "#1e293b", border: "none", color: "#cbd5e1", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", fontSize: 18 }}>×</button>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "8px 20px 20px" }}>{children}</div>
+      {footer && <div style={{ padding: 20 }}>{footer}</div>}
+    </div>
+  );
+}
+
+function DrinkDetailModal({ drink, onClose, onRemove }) {
+  if (!drink) return null;
+  const date = new Date(drink.timestamp);
+  return (
+    <ModalShell title={drink.name} onClose={onClose}
+      footer={<button onClick={() => onRemove(drink.id)} style={{ width: "100%", padding: 16, borderRadius: 16, background: "#ef4444", color: "white", fontWeight: 600, border: "none", cursor: "pointer" }}>Remove Drink</button>}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <InfoTile emoji="📅" value={date.toLocaleDateString()} label="Date" />
+        <InfoTile emoji="🕒" value={date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} label="Time" />
+        <InfoTile emoji="💧" value={`${drink.abv.toFixed(1)}%`} label="Alcohol" />
+        <InfoTile emoji="🔥" value={Math.round(drink.calories)} label="Calories" />
+        <InfoTile emoji="🧊" value={`${Math.round(drink.sugar)}g`} label="Sugar" />
+        <InfoTile emoji="⚡" value={`${Math.round(drink.caffeine)}mg`} label="Caffeine" />
+        <InfoTile emoji="🥤" value={`${drink.volumeOz.toFixed(1)} oz`} label="Amount" full />
+      </div>
+    </ModalShell>
+  );
+}
+
+// ---------- Settings modal ----------
+function SettingsModal({ profile, onSave, onClose }) {
+  const [weightLb, setWeightLb] = useState(profile?.weightLb || "");
+  const [sex, setSex] = useState(profile?.sex || "male");
+  const [apiKey, setApiKey] = useState(() => store.get("api-key") || "");
+  const [showKey, setShowKey] = useState(false);
+
+  const save = () => {
+    const w = parseFloat(weightLb);
+    store.set("api-key", apiKey.trim());
+    if (!w || w <= 0) return;
+    onSave({ weightLb: w, sex });
+  };
+
+  return (
+    <ModalShell title="Settings" onClose={onClose}
+      footer={<button onClick={save}
+        style={{ width: "100%", padding: 16, borderRadius: 16, background: "#22d3ee", color: "#020617", fontWeight: 600, border: "none", cursor: "pointer" }}>Save</button>}>
+      <div style={{ marginBottom: 20 }}>
+        <label style={{ fontSize: 14, color: "#94a3b8", marginBottom: 8, display: "block" }}>Body weight (lb)</label>
+        <input type="number" inputMode="decimal" value={weightLb} onChange={(e) => setWeightLb(e.target.value)} placeholder="e.g. 150"
+          style={{ width: "100%", background: "rgba(30,41,59,0.6)", border: "1px solid #334155", borderRadius: 12, padding: "12px 16px", color: "#f1f5f9", outline: "none", fontSize: 16 }} />
+      </div>
+      <div style={{ marginBottom: 20 }}>
+        <label style={{ fontSize: 14, color: "#94a3b8", marginBottom: 4, display: "block" }}>Biological sex</label>
+        <p style={{ fontSize: 12, color: "#64748b", marginBottom: 8 }}>Used only for the BAC formula's body-water ratio.</p>
+        <div style={{ display: "flex", gap: 8 }}>
+          <PillButton active={sex === "male"} onClick={() => setSex("male")}>Male</PillButton>
+          <PillButton active={sex === "female"} onClick={() => setSex("female")}>Female</PillButton>
+        </div>
+      </div>
+      <div style={{ marginBottom: 20 }}>
+        <label style={{ fontSize: 14, color: "#94a3b8", marginBottom: 4, display: "block" }}>Anthropic API key</label>
+        <p style={{ fontSize: 12, color: "#64748b", marginBottom: 8 }}>Needed for the Describe (AI estimate) feature. Get one at console.anthropic.com. Stored only on this device.</p>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input type={showKey ? "text" : "password"} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-ant-..."
+            style={{ flex: 1, background: "rgba(30,41,59,0.6)", border: "1px solid #334155", borderRadius: 12, padding: "12px 16px", color: "#f1f5f9", outline: "none", fontSize: 14 }} />
+          <button onClick={() => setShowKey(!showKey)} style={{ padding: "0 14px", borderRadius: 12, border: "1px solid #334155", background: "rgba(30,41,59,0.6)", color: "#cbd5e1", cursor: "pointer" }}>{showKey ? "Hide" : "Show"}</button>
+        </div>
+      </div>
+      <p style={{ fontSize: 12, color: "#64748b", lineHeight: 1.6 }}>BAC estimates are approximate and affected by food, medication, and metabolism. Never use this to decide whether it's safe to drive.</p>
+    </ModalShell>
+  );
+}
+
+// ---------- Add Drink modal ----------
+const EMPTY_DRAFT = { name: "", abv: "", volumeOz: "", calories: "", sugar: "", caffeine: "" };
+
+function buildDrink(draft) {
+  const abv = parseFloat(draft.abv), volumeOz = parseFloat(draft.volumeOz);
+  if (!draft.name.trim() || isNaN(abv) || isNaN(volumeOz)) return null;
+  return { id: uid(), name: draft.name.trim(), abv, volumeOz,
+    calories: parseFloat(draft.calories) || 0, sugar: parseFloat(draft.sugar) || 0, caffeine: parseFloat(draft.caffeine) || 0,
+    timestamp: Date.now() };
+}
+
+function Field({ label, value, onChange, type = "text", placeholder }) {
+  return (
+    <div>
+      <label style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6, display: "block" }}>{label}</label>
+      <input type={type} inputMode={type === "number" ? "decimal" : "text"} value={value} onChange={onChange} placeholder={placeholder}
+        style={{ width: "100%", background: "rgba(30,41,59,0.6)", border: "1px solid #334155", borderRadius: 12, padding: "10px 14px", color: "#f1f5f9", outline: "none", fontSize: 15 }} />
+    </div>
+  );
+}
+
+function DraftForm({ draft, setDraft, onConfirm, confirmLabel, saveCustomOption, saveCustom, setSaveCustom, note }) {
+  const set = (k) => (e) => setDraft({ ...draft, [k]: e.target.value });
+  const valid = draft.name.trim() && draft.abv !== "" && draft.volumeOz !== "";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {note && <div style={{ display: "flex", gap: 8, background: "rgba(30,41,59,0.6)", border: "1px solid rgba(51,65,85,0.5)", borderRadius: 12, padding: 12, fontSize: 12, color: "#94a3b8" }}><span>ℹ️</span><span>{note}</span></div>}
+      <Field label="Drink name" value={draft.name} onChange={set("name")} placeholder="Vodka Redbull" />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Field label="ABV %" value={draft.abv} onChange={set("abv")} type="number" placeholder="14" />
+        <Field label="Volume (oz)" value={draft.volumeOz} onChange={set("volumeOz")} type="number" placeholder="10" />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+        <Field label="Calories" value={draft.calories} onChange={set("calories")} type="number" placeholder="210" />
+        <Field label="Sugar (g)" value={draft.sugar} onChange={set("sugar")} type="number" placeholder="27" />
+        <Field label="Caffeine (mg)" value={draft.caffeine} onChange={set("caffeine")} type="number" placeholder="80" />
+      </div>
+      {saveCustomOption && (
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, color: "#cbd5e1" }}>
+          <input type="checkbox" checked={saveCustom} onChange={(e) => setSaveCustom(e.target.checked)} />
+          Save as a custom drink for later
+        </label>
+      )}
+      <button disabled={!valid} onClick={onConfirm} style={{
+        width: "100%", padding: 16, borderRadius: 16, border: "none", fontWeight: 600, cursor: valid ? "pointer" : "default",
+        background: valid ? "#22d3ee" : "#334155", color: valid ? "#020617" : "#64748b",
+      }}>{confirmLabel}</button>
+    </div>
+  );
+}
+
+function DescribeTab({ onLog, onSaveCustom }) {
+  const [text, setText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [draft, setDraft] = useState(null);
+  const [saveCustom, setSaveCustom] = useState(false);
+
+  const estimate = async () => {
+    if (!text.trim()) return;
+    const apiKey = store.get("api-key");
+    if (!apiKey) {
+      setError("Add your Anthropic API key in Settings (gear icon) first.");
+      return;
+    }
+    setLoading(true); setError(""); setDraft(null);
+    try {
+      const prompt = `You are an expert bartender and nutrition estimator. Given a casual, possibly informal description of an alcoholic drink, respond with ONLY a raw JSON object, no markdown fences, no prose, with exactly these keys: name (short clean drink name, string), abv (percent alcohol by volume as a typical value, number), volumeOz (typical serving size in fluid ounces, number), calories (number), sugarG (grams of sugar, number), caffeineMg (milligrams of caffeine, 0 if none, number). Base it on standard recipes and typical bar serving sizes. Drink description: "${text.trim()}"`;
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 500, messages: [{ role: "user", content: prompt }] }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error((data && data.error && data.error.message) || "failed");
+      const raw = (data.content || []).map((c) => c.text || "").join("").trim();
+      const cleaned = raw.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      setDraft({
+        name: parsed.name || text.trim(), abv: String(parsed.abv ?? ""), volumeOz: String(parsed.volumeOz ?? ""),
+        calories: String(Math.round(parsed.calories ?? 0)), sugar: String(Math.round(parsed.sugarG ?? 0)), caffeine: String(Math.round(parsed.caffeineMg ?? 0)),
+      });
+    } catch (e) {
+      setError("Couldn't get an estimate (" + (e.message || "error") + "). Check your API key in Settings, or enter it manually below.");
+      setDraft({ ...EMPTY_DRAFT, name: text.trim() });
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div>
+        <label style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6, display: "block" }}>What did you drink?</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input value={text} onChange={(e) => setText(e.target.value)} placeholder="frozen margarita, vodka redbull..."
+            style={{ flex: 1, background: "rgba(30,41,59,0.6)", border: "1px solid #334155", borderRadius: 12, padding: "10px 14px", color: "#f1f5f9", outline: "none", fontSize: 15 }} />
+          <button onClick={estimate} disabled={loading || !text.trim()} style={{
+            padding: "0 16px", borderRadius: 12, border: "none", background: loading || !text.trim() ? "#334155" : "#22d3ee",
+            color: "#020617", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+            {loading ? <Spinner /> : "✨"}
+          </button>
+        </div>
+        {error && <p style={{ fontSize: 12, color: "#f87171", marginTop: 8 }}>{error}</p>}
+      </div>
+      {draft && (
+        <DraftForm draft={draft} setDraft={setDraft} confirmLabel="Log Drink" saveCustomOption saveCustom={saveCustom} setSaveCustom={setSaveCustom}
+          note="Review Claude's estimate below and adjust anything before logging."
+          onConfirm={() => { const d = buildDrink(draft); if (!d) return; onLog(d); if (saveCustom) onSaveCustom(d); }} />
+      )}
+    </div>
+  );
+}
+
+function ScanTab({ onLog, onSaveCustom }) {
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const [scanning, setScanning] = useState(false);
+  const supported = typeof window !== "undefined" && "BarcodeDetector" in window;
+  const [status, setStatus] = useState("");
+  const [barcode, setBarcode] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [draft, setDraft] = useState(null);
+  const [saveCustom, setSaveCustom] = useState(false);
+
+  const stopCamera = useCallback(() => { streamRef.current?.getTracks().forEach((t) => t.stop()); streamRef.current = null; setScanning(false); }, []);
+  useEffect(() => () => stopCamera(), [stopCamera]);
+
+  const startCamera = async () => {
+    setStatus("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      streamRef.current = stream;
+      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
+      setScanning(true);
+      if (supported) detectLoop(); else setStatus("Live scanning isn't supported in this browser — enter the barcode number below instead.");
+    } catch (e) { setStatus("Couldn't access the camera. You can still enter the barcode number below."); }
+  };
+
+  const detectLoop = async () => {
+    if (!streamRef.current) return;
+    try {
+      const detector = new window.BarcodeDetector({ formats: ["ean_13", "ean_8", "upc_a", "upc_e"] });
+      const codes = await detector.detect(videoRef.current);
+      if (codes.length) { stopCamera(); lookupBarcode(codes[0].rawValue); return; }
+    } catch (e) {}
+    if (streamRef.current) requestAnimationFrame(() => setTimeout(detectLoop, 400));
+  };
+
+  const lookupBarcode = async (code) => {
+    setLoading(true); setStatus(""); setDraft(null);
+    try {
+      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${code}.json`);
+      const data = await res.json();
+      if (data.status !== 1) {
+        setStatus("No match found for that barcode — alcohol coverage in the database is limited. Fill in the details manually.");
+        setDraft({ ...EMPTY_DRAFT });
+      } else {
+        const p = data.product; const n = p.nutriments || {};
+        setDraft({
+          name: p.product_name || "Scanned drink", abv: String(p.alcohol_value ?? ""),
+          volumeOz: p.serving_size ? String((parseFloat(p.serving_size) / ML_PER_OZ).toFixed(1)) : "",
+          calories: String(Math.round(n["energy-kcal_serving"] ?? n["energy-kcal_100g"] ?? 0)),
+          sugar: String(Math.round(n["sugars_serving"] ?? n["sugars_100g"] ?? 0)),
+          caffeine: String(Math.round(n["caffeine_serving"] ?? n["caffeine_100g"] ?? 0)),
+        });
+        setStatus("Found a match — double check the numbers, the database doesn't always have alcohol % right.");
+      }
+    } catch (e) { setStatus("Lookup failed. Enter the details manually below."); setDraft({ ...EMPTY_DRAFT }); }
+    finally { setLoading(false); }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {!draft && (
+        <>
+          <div style={{ borderRadius: 16, overflow: "hidden", background: "#0f172a", aspectRatio: "1", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid rgba(51,65,85,0.5)" }}>
+            {scanning ? <video ref={videoRef} style={{ width: "100%", height: "100%", objectFit: "cover" }} muted playsInline /> :
+              <div style={{ textAlign: "center", color: "#64748b", padding: 24 }}><div style={{ fontSize: 32, marginBottom: 8 }}>📷</div><p style={{ fontSize: 14 }}>Point your camera at the barcode</p></div>}
+          </div>
+          {!scanning ? (
+            <button onClick={startCamera} style={{ width: "100%", padding: 14, borderRadius: 16, background: "#22d3ee", color: "#020617", fontWeight: 600, border: "none", cursor: "pointer" }}>📷 Start Camera</button>
+          ) : (
+            <button onClick={stopCamera} style={{ width: "100%", padding: 14, borderRadius: 16, background: "#1e293b", color: "#cbd5e1", fontWeight: 600, border: "none", cursor: "pointer" }}>Stop Camera</button>
+          )}
+          {status && <p style={{ fontSize: 12, color: "#fbbf24" }}>{status}</p>}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ height: 1, background: "#1e293b", flex: 1 }} /><span style={{ fontSize: 12, color: "#64748b" }}>or</span><div style={{ height: 1, background: "#1e293b", flex: 1 }} />
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={barcode} onChange={(e) => setBarcode(e.target.value)} placeholder="Enter barcode number" inputMode="numeric"
+              style={{ flex: 1, background: "rgba(30,41,59,0.6)", border: "1px solid #334155", borderRadius: 12, padding: "10px 14px", color: "#f1f5f9", outline: "none" }} />
+            <button onClick={() => lookupBarcode(barcode.trim())} disabled={!barcode.trim() || loading}
+              style={{ padding: "0 16px", borderRadius: 12, border: "none", background: "#1e293b", color: "#f1f5f9", cursor: "pointer" }}>
+              {loading ? <Spinner /> : "Look up"}
+            </button>
+          </div>
+        </>
+      )}
+      {draft && (
+        <>
+          {status && <p style={{ fontSize: 12, color: "#94a3b8" }}>{status}</p>}
+          <DraftForm draft={draft} setDraft={setDraft} confirmLabel="Log Drink" saveCustomOption saveCustom={saveCustom} setSaveCustom={setSaveCustom}
+            onConfirm={() => { const d = buildDrink(draft); if (!d) return; onLog(d); if (saveCustom) onSaveCustom(d); }} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function SavedTab({ customDrinks, onLog, onSaveCustom }) {
+  const [showForm, setShowForm] = useState(false);
+  const [draft, setDraft] = useState(EMPTY_DRAFT);
+  if (showForm) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <DraftForm draft={draft} setDraft={setDraft} confirmLabel="Save Custom Drink"
+          onConfirm={() => { const d = buildDrink(draft); if (!d) return; onSaveCustom(d); setDraft(EMPTY_DRAFT); setShowForm(false); }} />
+        <button onClick={() => setShowForm(false)} style={{ width: "100%", padding: 12, background: "none", border: "none", color: "#94a3b8", fontSize: 14, cursor: "pointer" }}>Cancel</button>
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <button onClick={() => setShowForm(true)} style={{ width: "100%", padding: 14, borderRadius: 16, border: "1px dashed #334155", background: "none", color: "#94a3b8", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 14, fontWeight: 500, cursor: "pointer" }}>+ New custom drink</button>
+      {customDrinks.length === 0 && <p style={{ fontSize: 14, color: "#64748b", textAlign: "center", padding: "24px 0" }}>No saved drinks yet. Drinks you log via Describe or Scan can be saved here too.</p>}
+      {customDrinks.map((d) => (
+        <button key={d.id} onClick={() => onLog({ ...d, id: uid(), timestamp: Date.now() })}
+          style={{ width: "100%", textAlign: "left", background: "rgba(30,41,59,0.6)", border: "1px solid rgba(51,65,85,0.5)", borderRadius: 16, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}>
+          <div>
+            <div style={{ fontWeight: 600, color: "#f1f5f9" }}>{d.name}</div>
+            <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 4 }}>{d.abv.toFixed(1)}% · {Math.round(d.calories)} cal · {d.volumeOz.toFixed(1)} oz</div>
+          </div>
+          <span style={{ color: "#22d3ee", fontSize: 20 }}>+</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function AddDrinkModal({ onClose, onLog, customDrinks, onSaveCustom }) {
+  const [tab, setTab] = useState("describe");
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "#020617", display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "24px 20px 8px" }}>
+        <h2 style={{ fontSize: 24, fontWeight: 700, color: "#f1f5f9", margin: 0 }}>Add Drink</h2>
+        <button onClick={onClose} style={{ width: 36, height: 36, borderRadius: "50%", background: "#1e293b", border: "none", color: "#cbd5e1", cursor: "pointer", fontSize: 18 }}>×</button>
+      </div>
+      <div style={{ display: "flex", gap: 8, padding: "8px 20px 16px" }}>
+        <PillButton active={tab === "describe"} onClick={() => setTab("describe")}>✨ Describe</PillButton>
+        <PillButton active={tab === "scan"} onClick={() => setTab("scan")}>📷 Scan</PillButton>
+        <PillButton active={tab === "saved"} onClick={() => setTab("saved")}>📖 Saved</PillButton>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 20px" }}>
+        {tab === "describe" && <DescribeTab onLog={onLog} onSaveCustom={onSaveCustom} />}
+        {tab === "scan" && <ScanTab onLog={onLog} onSaveCustom={onSaveCustom} />}
+        {tab === "saved" && <SavedTab customDrinks={customDrinks} onLog={onLog} onSaveCustom={onSaveCustom} />}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Insights view ----------
+function BarChart({ data }) {
+  const max = Math.max(1, ...data.map((d) => d.value));
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: "100%" }}>
+      {data.map((d, i) => (
+        <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", height: "100%" }}>
+          {d.value > 0 && <span style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>{d.value}</span>}
+          <div style={{ width: "100%", maxWidth: 28, height: `${(d.value / max) * 85}%`, minHeight: d.value > 0 ? 4 : 2,
+            background: d.value > 0 ? "#38bdf8" : "#1e293b", borderRadius: "6px 6px 0 0" }} />
+          <span style={{ fontSize: 11, color: "#64748b", marginTop: 6 }}>{d.label}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function buildInsights(total, daysWithAlcohol, totalDays, quietWeekend, heaviestLabel, heaviestCount) {
+  const insights = [];
+  if (total === 0) { insights.push({ emoji: "✨", text: "No drinks logged in this period — a clean slate." }); return insights; }
+  const rate = daysWithAlcohol / totalDays;
+  if (rate <= 0.3) insights.push({ emoji: "📈", text: `You had alcohol on ${daysWithAlcohol} of ${totalDays} days, showing good restraint.` });
+  else if (rate <= 0.6) insights.push({ emoji: "📊", text: `You had alcohol on ${daysWithAlcohol} of ${totalDays} days this period.` });
+  else insights.push({ emoji: "⚠️", text: `You had alcohol on ${daysWithAlcohol} of ${totalDays} days — more frequent than most periods.` });
+  if (quietWeekend) insights.push({ emoji: "🗓️", text: "You didn't drink on the weekend, showing good control during typical social drinking times." });
+  if (heaviestCount > 0) insights.push({ emoji: "🔎", text: `${heaviestLabel} was your heaviest day, with ${heaviestCount} drink${heaviestCount === 1 ? "" : "s"} logged.` });
+  return insights;
+}
+
+function InsightsView({ drinks }) {
+  const [period, setPeriod] = useState("week");
+  const now = new Date();
+
+  const { chartData, stats, insights } = useMemo(() => {
+    if (period === "week") {
+      const start = startOfWeek(now);
+      const days = Array.from({ length: 7 }, (_, i) => { const d = new Date(start); d.setDate(start.getDate() + i); return d; });
+      const counts = days.map((d) => drinks.filter((dr) => isSameDay(dr.timestamp, d)).length);
+      const daysWithAlcohol = counts.filter((c) => c > 0).length;
+      const total = counts.reduce((a, b) => a + b, 0);
+      const chartData = days.map((d, i) => ({ label: WEEKDAY_LABELS[d.getDay()], value: counts[i] }));
+      const heaviestIdx = counts.indexOf(Math.max(...counts));
+      const insights = buildInsights(total, daysWithAlcohol, 7, counts[6] === 0 && counts[0] === 0, WEEKDAY_LABELS[days[heaviestIdx].getDay()], counts[heaviestIdx]);
+      return { chartData, stats: { total, avg: daysWithAlcohol ? (total / daysWithAlcohol).toFixed(1) : "0.0", daysWithAlcohol, alcoholFree: 7 - daysWithAlcohol, totalDays: 7 }, insights };
+    }
+    if (period === "month") {
+      const year = now.getFullYear(), month = now.getMonth();
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      const weeks = [0, 0, 0, 0, 0]; let total = 0, daysWithAlcohol = 0;
+      for (let day = 1; day <= daysInMonth; day++) {
+        const d = new Date(year, month, day);
+        const count = drinks.filter((dr) => isSameDay(dr.timestamp, d)).length;
+        total += count; if (count > 0) daysWithAlcohol++;
+        weeks[Math.floor((day - 1) / 7)] += count;
+      }
+      const chartData = weeks.map((v, i) => ({ label: `W${i + 1}`, value: v }));
+      const insights = buildInsights(total, daysWithAlcohol, daysInMonth);
+      return { chartData, stats: { total, avg: daysWithAlcohol ? (total / daysWithAlcohol).toFixed(1) : "0.0", daysWithAlcohol, alcoholFree: daysInMonth - daysWithAlcohol, totalDays: daysInMonth }, insights };
+    }
+    const year = now.getFullYear();
+    const monthCounts = Array(12).fill(0); let total = 0; const dayset = new Set();
+    drinks.forEach((dr) => { const d = new Date(dr.timestamp); if (d.getFullYear() === year) { monthCounts[d.getMonth()]++; total++; dayset.add(d.toDateString()); } });
+    const daysWithAlcohol = dayset.size;
+    const chartData = monthCounts.map((v, i) => ({ label: MONTH_LABELS[i], value: v }));
+    const totalDays = 365;
+    const insights = buildInsights(total, daysWithAlcohol, totalDays);
+    return { chartData, stats: { total, avg: daysWithAlcohol ? (total / daysWithAlcohol).toFixed(1) : "0.0", daysWithAlcohol, alcoholFree: totalDays - daysWithAlcohol, totalDays }, insights };
+  }, [period, drinks]);
+
+  const pct = stats.totalDays ? Math.round((stats.alcoholFree / stats.totalDays) * 100) : 0;
+
+  return (
+    <div style={{ paddingBottom: 112 }}>
+      <div style={{ display: "flex", gap: 8, padding: "0 4px", marginBottom: 20 }}>
+        <PillButton active={period === "week"} onClick={() => setPeriod("week")}>Week</PillButton>
+        <PillButton active={period === "month"} onClick={() => setPeriod("month")}>Month</PillButton>
+        <PillButton active={period === "year"} onClick={() => setPeriod("year")}>Year</PillButton>
+      </div>
+      <div style={{ background: "rgba(15,23,42,0.6)", border: "1px solid #1e293b", borderRadius: 16, padding: 20, marginBottom: 16 }}>
+        <h3 style={{ fontSize: 18, fontWeight: 700, color: "#f1f5f9", marginTop: 0, marginBottom: 16 }}>Overview</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+          <StatTile emoji="🍸" value={stats.total} label="Total Drinks" />
+          <StatTile emoji="📊" value={stats.avg} label="Avg. per Drinking Day" />
+          <StatTile emoji="⚠️" value={stats.daysWithAlcohol} label="Days with Alcohol" />
+          <StatTile emoji="✅" value={stats.alcoholFree} label="Alcohol-Free Days" />
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, marginBottom: 8 }}>
+          <span style={{ color: "#cbd5e1", fontWeight: 500 }}>Alcohol-Free Days</span><span style={{ color: "#34d399", fontWeight: 700 }}>{pct}%</span>
+        </div>
+        <div style={{ height: 8, borderRadius: 999, background: "#1e293b", overflow: "hidden" }}>
+          <div style={{ height: "100%", width: `${pct}%`, background: "#34d399", borderRadius: 999 }} />
+        </div>
+      </div>
+      <div style={{ background: "rgba(15,23,42,0.6)", border: "1px solid #1e293b", borderRadius: 16, padding: 20, marginBottom: 16 }}>
+        <h3 style={{ fontSize: 18, fontWeight: 700, color: "#f1f5f9", marginTop: 0, marginBottom: 4 }}>Daily Consumption</h3>
+        <p style={{ fontSize: 12, color: "#64748b", marginBottom: 16 }}>Number of drinks per {period === "week" ? "day" : period === "month" ? "week" : "month"}</p>
+        <div style={{ height: 180 }}><BarChart data={chartData} /></div>
+      </div>
+      <div style={{ background: "rgba(15,23,42,0.6)", border: "1px solid #1e293b", borderRadius: 16, padding: 20 }}>
+        <h3 style={{ fontSize: 18, fontWeight: 700, color: "#f1f5f9", marginTop: 0, marginBottom: 16 }}>Pattern Analysis</h3>
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {insights.map((ins, i) => (
+            <div key={i} style={{ display: "flex", gap: 12 }}>
+              <span style={{ fontSize: 18, flexShrink: 0 }}>{ins.emoji}</span>
+              <p style={{ fontSize: 14, color: "#cbd5e1", lineHeight: 1.6, margin: 0 }}>{ins.text}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Main App ----------
+function App() {
+  const [drinks, setDrinks] = useState(() => store.get("drinks") || []);
+  const [customDrinks, setCustomDrinks] = useState(() => store.get("custom-drinks") || []);
+  const [profile, setProfile] = useState(() => store.get("profile"));
+  const [selectedDate, setSelectedDate] = useState(new Date());
+  const [view, setView] = useState("dashboard");
+  const [addOpen, setAddOpen] = useState(false);
+  const [detailDrink, setDetailDrink] = useState(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const logDrink = (drink) => { const next = [...drinks, drink]; setDrinks(next); store.set("drinks", next); setAddOpen(false); setSelectedDate(new Date(drink.timestamp)); };
+  const removeDrink = (id) => { const next = drinks.filter((d) => d.id !== id); setDrinks(next); store.set("drinks", next); setDetailDrink(null); };
+  const saveCustomDrink = (drink) => { const preset = { ...drink, id: uid() }; const next = [...customDrinks, preset]; setCustomDrinks(next); store.set("custom-drinks", next); };
+  const saveProfile = (p) => { setProfile(p); store.set("profile", p); setSettingsOpen(false); };
+
+  const drinksByDay = useMemo(() => {
+    const m = new Map();
+    drinks.forEach((d) => { const key = new Date(d.timestamp).toDateString(); if (!m.has(key)) m.set(key, []); m.get(key).push(d); });
+    return m;
+  }, [drinks]);
+
+  const dayDrinks = (drinksByDay.get(selectedDate.toDateString()) || []).sort((a, b) => b.timestamp - a.timestamp);
+  const isToday = isSameDay(Date.now(), selectedDate);
+  const session = calcSession(drinks, profile);
+  const dayCalories = dayDrinks.reduce((s, d) => s + d.calories, 0);
+
+  return (
+    <div style={{ minHeight: "100vh", background: "linear-gradient(to bottom, #020617, rgba(23,37,84,0.4), #020617)", color: "#f1f5f9" }}>
+      <div style={{ maxWidth: 448, margin: "0 auto", padding: "24px 20px 112px" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 36, height: 36, borderRadius: 12, background: "rgba(34,211,238,0.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>🍸</div>
+            <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0, letterSpacing: "-0.02em" }}>Proof</h1>
+          </div>
+          <button onClick={() => setSettingsOpen(true)} style={{ width: 36, height: 36, borderRadius: "50%", background: "rgba(30,41,59,0.7)", border: "none", color: "#cbd5e1", cursor: "pointer", fontSize: 16 }}>⚙️</button>
+        </div>
+
+        {view === "dashboard" ? (
+          <React.Fragment>
+            <WeekStrip selectedDate={selectedDate} setSelectedDate={setSelectedDate} drinksByDay={drinksByDay} />
+            <div style={{ background: "rgba(15,23,42,0.6)", border: "1px solid #1e293b", borderRadius: 16, padding: 20, marginBottom: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                <h3 style={{ fontSize: 18, fontWeight: 700, display: "flex", alignItems: "center", gap: 8, margin: 0 }}>📊 Consumption</h3>
+                <button onClick={() => setSettingsOpen(true)} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, background: "#1e293b", borderRadius: 999, padding: "6px 12px", color: "#cbd5e1", border: "none", cursor: "pointer" }}>👤 Metrics</button>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <StatTile emoji="🍸" value={dayDrinks.length} label="Drinks" />
+                <StatTile emoji="🔥" value={Math.round(dayCalories)} label="Calories" color="#fb923c" />
+                {isToday ? (
+                  <React.Fragment>
+                    <StatTile emoji="🩸" value={`${session.bac.toFixed(2)}%`} label="Est. BAC" color={bacColor(session.bac)} ring={{ pct: Math.min(session.bac / 0.15, 1), color: bacColor(session.bac) }} />
+                    <StatTile emoji="⏱️" value={fmtClearance(session.clearanceHours)} label="Clearance Time" />
+                  </React.Fragment>
+                ) : (
+                  <div style={{ gridColumn: "span 2", background: "rgba(30,41,59,0.4)", border: "1px solid rgba(51,65,85,0.5)", borderRadius: 16, padding: 16, fontSize: 14, color: "#94a3b8" }}>⏱️ BAC only shown for today</div>
+                )}
+              </div>
+              {isToday && !profile?.weightLb && <p style={{ fontSize: 12, color: "#fbbf24", marginTop: 12 }}>Add your weight in Settings to see BAC estimates.</p>}
+            </div>
+            <div style={{ background: "rgba(15,23,42,0.6)", border: "1px solid #1e293b", borderRadius: 16, padding: 20 }}>
+              <h3 style={{ fontSize: 18, fontWeight: 700, display: "flex", alignItems: "center", gap: 8, marginTop: 0, marginBottom: 16 }}>📖 Drinks Log</h3>
+              {dayDrinks.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "32px 0", color: "#64748b" }}>
+                  <div style={{ fontSize: 28, opacity: 0.5, marginBottom: 8 }}>🍸</div>
+                  <p style={{ fontSize: 14 }}>Nothing logged {isToday ? "today" : "this day"}.</p>
+                  {isToday && <p style={{ fontSize: 12, marginTop: 4 }}>Tap + to add a drink.</p>}
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  {dayDrinks.map((d) => <DrinkRow key={d.id} drink={d} onOpen={setDetailDrink} />)}
+                </div>
+              )}
+            </div>
+          </React.Fragment>
+        ) : <InsightsView drinks={drinks} />}
+      </div>
+
+      <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, background: "rgba(2,6,23,0.95)", backdropFilter: "blur(8px)", borderTop: "1px solid #1e293b" }}>
+        <div style={{ maxWidth: 448, margin: "0 auto", padding: "12px 32px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "relative" }}>
+          <button onClick={() => setView("dashboard")} style={{ background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, color: view === "dashboard" ? "#22d3ee" : "#64748b", cursor: "pointer" }}>
+            <span style={{ fontSize: 18 }}>📊</span><span style={{ fontSize: 12, fontWeight: 500 }}>Dashboard</span>
+          </button>
+          <button onClick={() => setAddOpen(true)} style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", top: -24, width: 56, height: 56, borderRadius: "50%", background: "#22d3ee", border: "4px solid #020617", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 10px 25px rgba(34,211,238,0.3)" }}>
+            <span style={{ fontSize: 26, color: "#020617", fontWeight: 400, lineHeight: 1 }}>+</span>
+          </button>
+          <button onClick={() => setView("insights")} style={{ background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, color: view === "insights" ? "#22d3ee" : "#64748b", cursor: "pointer" }}>
+            <span style={{ fontSize: 18 }}>📈</span><span style={{ fontSize: 12, fontWeight: 500 }}>Insights</span>
+          </button>
+        </div>
+      </div>
+
+      {addOpen && <AddDrinkModal onClose={() => setAddOpen(false)} onLog={logDrink} customDrinks={customDrinks} onSaveCustom={saveCustomDrink} />}
+      {detailDrink && <DrinkDetailModal drink={detailDrink} onClose={() => setDetailDrink(null)} onRemove={removeDrink} />}
+      {settingsOpen && <SettingsModal profile={profile} onSave={saveProfile} onClose={() => setSettingsOpen(false)} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
